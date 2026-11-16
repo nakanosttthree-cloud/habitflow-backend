@@ -41,7 +41,9 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0
 });
-
+// Đăng ký, đăng nhập.
+const { createAuthRouter } = require('./auth');
+app.use('/api/auth', createAuthRouter(pool));
 // Kiểm tra API và kết nối database.
 app.get('/health', async (req, res) => {
   try {
