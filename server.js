@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const express = require('express');
@@ -6,10 +5,13 @@ const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
 
+const { createAuthRouter, requireAuth } = require('./auth');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+
 // Android HttpURLConnection không có PATCH: cho phép POST + header override.
 app.use((req, res, next) => {
   if (
@@ -41,9 +43,15 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0
 });
-// Đăng ký, đăng nhập.
-const { createAuthRouter } = require('./auth');
+
+// Đăng ký, đăng nhập (không cần mã đăng nhập).
 app.use('/api/auth', createAuthRouter(pool));
+
+// Mọi API dữ liệu bên dưới đều yêu cầu đăng nhập.
+app.use('/api/tasks', requireAuth);
+app.use('/api/habits', requireAuth);
+app.use('/api/stats', requireAuth);
+
 // Kiểm tra API và kết nối database.
 app.get('/health', async (req, res) => {
   try {
@@ -64,11 +72,14 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Lấy danh sách công việc.
+/* ========== TASKS API ========== */
+
+// Lấy danh sách công việc của người dùng.
 app.get('/api/tasks', async (req, res) => {
   try {
-    const [tasks] = await pool.query(
-      'SELECT * FROM tasks ORDER BY created_at DESC'
+    const [tasks] = await pool.execute(
+      'SELECT * FROM tasks WHERE user_id = ? ORDER BY created_at DESC',
+      [req.user.id]
     );
 
     res.json(tasks);
@@ -82,8 +93,8 @@ app.get('/api/tasks', async (req, res) => {
 app.get('/api/tasks/:id', async (req, res) => {
   try {
     const [tasks] = await pool.execute(
-      'SELECT * FROM tasks WHERE id = ?',
-      [req.params.id]
+      'SELECT * FROM tasks WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     if (tasks.length === 0) {
@@ -118,9 +129,10 @@ app.post('/api/tasks', async (req, res) => {
 
   try {
     const [result] = await pool.execute(
-      `INSERT INTO tasks (title, description, due_date, priority)
-       VALUES (?, ?, ?, ?)`,
+      `INSERT INTO tasks (user_id, title, description, due_date, priority)
+       VALUES (?, ?, ?, ?, ?)`,
       [
+        req.user.id,
         title.trim(),
         description ?? null,
         due_date || null,
@@ -129,8 +141,8 @@ app.post('/api/tasks', async (req, res) => {
     );
 
     const [tasks] = await pool.execute(
-      'SELECT * FROM tasks WHERE id = ?',
-      [result.insertId]
+      'SELECT * FROM tasks WHERE id = ? AND user_id = ?',
+      [result.insertId, req.user.id]
     );
 
     res.status(201).json(tasks[0]);
@@ -175,14 +187,15 @@ app.put('/api/tasks/:id', async (req, res) => {
       `UPDATE tasks
        SET title = ?, description = ?, due_date = ?,
            priority = ?, is_completed = ?
-       WHERE id = ?`,
+       WHERE id = ? AND user_id = ?`,
       [
         title.trim(),
         description ?? null,
         due_date || null,
         priority || 'medium',
         is_completed === undefined ? 0 : Number(is_completed),
-        req.params.id
+        req.params.id,
+        req.user.id
       ]
     );
 
@@ -191,8 +204,8 @@ app.put('/api/tasks/:id', async (req, res) => {
     }
 
     const [tasks] = await pool.execute(
-      'SELECT * FROM tasks WHERE id = ?',
-      [req.params.id]
+      'SELECT * FROM tasks WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     res.json(tasks[0]);
@@ -206,8 +219,8 @@ app.put('/api/tasks/:id', async (req, res) => {
 app.delete('/api/tasks/:id', async (req, res) => {
   try {
     const [result] = await pool.execute(
-      'DELETE FROM tasks WHERE id = ?',
-      [req.params.id]
+      'DELETE FROM tasks WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     if (result.affectedRows === 0) {
@@ -223,7 +236,7 @@ app.delete('/api/tasks/:id', async (req, res) => {
 
 /* ========== HABITS API ========== */
 
-// 1. Lấy danh sách thói quen
+// 1. Lấy danh sách thói quen của người dùng
 // Dùng: GET /api/habits?date=YYYY-MM-DD (ngày hôm nay theo máy người dùng)
 app.get('/api/habits', async (req, res) => {
   const today = req.query.date;
@@ -243,9 +256,10 @@ app.get('/api/habits', async (req, res) => {
            AS completed_today
        FROM habits h
        LEFT JOIN habit_logs hl ON hl.habit_id = h.id
+       WHERE h.user_id = ?
        GROUP BY h.id
        ORDER BY h.created_at DESC`,
-      [today || null]
+      [today || null, req.user.id]
     );
 
     res.json(habits);
@@ -290,9 +304,10 @@ app.post('/api/habits', async (req, res) => {
   try {
     const [result] = await pool.execute(
       `INSERT INTO habits
-       (name, description, frequency_type, target_per_week)
-       VALUES (?, ?, ?, ?)`,
+       (user_id, name, description, frequency_type, target_per_week)
+       VALUES (?, ?, ?, ?, ?)`,
       [
+        req.user.id,
         name.trim(),
         description ?? null,
         frequency,
@@ -301,8 +316,8 @@ app.post('/api/habits', async (req, res) => {
     );
 
     const [habits] = await pool.execute(
-      'SELECT * FROM habits WHERE id = ?',
-      [result.insertId]
+      'SELECT * FROM habits WHERE id = ? AND user_id = ?',
+      [result.insertId, req.user.id]
     );
 
     res.status(201).json(habits[0]);
@@ -365,16 +380,16 @@ app.patch('/api/habits/:id', async (req, res) => {
   }
 
   try {
-    values.push(req.params.id);
+    values.push(req.params.id, req.user.id);
 
-    const [result] = await pool.execute(
-      `UPDATE habits SET ${fields.join(', ')} WHERE id = ?`,
+    await pool.execute(
+      `UPDATE habits SET ${fields.join(', ')} WHERE id = ? AND user_id = ?`,
       values
     );
 
     const [habits] = await pool.execute(
-      'SELECT * FROM habits WHERE id = ?',
-      [req.params.id]
+      'SELECT * FROM habits WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     if (habits.length === 0) {
@@ -401,8 +416,8 @@ app.post('/api/habits/:id/logs', async (req, res) => {
 
   try {
     const [habits] = await pool.execute(
-      'SELECT id FROM habits WHERE id = ?',
-      [req.params.id]
+      'SELECT id FROM habits WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     if (habits.length === 0) {
@@ -437,10 +452,12 @@ app.post('/api/habits/:id/logs', async (req, res) => {
 app.get('/api/habits/:id/logs', async (req, res) => {
   try {
     const [logs] = await pool.execute(
-      `SELECT * FROM habit_logs
-       WHERE habit_id = ?
-       ORDER BY completed_date DESC`,
-      [req.params.id]
+      `SELECT hl.*
+       FROM habit_logs hl
+       JOIN habits h ON h.id = hl.habit_id
+       WHERE hl.habit_id = ? AND h.user_id = ?
+       ORDER BY hl.completed_date DESC`,
+      [req.params.id, req.user.id]
     );
 
     res.json(logs);
@@ -454,8 +471,8 @@ app.get('/api/habits/:id/logs', async (req, res) => {
 app.delete('/api/habits/:id', async (req, res) => {
   try {
     const [result] = await pool.execute(
-      'DELETE FROM habits WHERE id = ?',
-      [req.params.id]
+      'DELETE FROM habits WHERE id = ? AND user_id = ?',
+      [req.params.id, req.user.id]
     );
 
     if (result.affectedRows === 0) {
@@ -468,6 +485,7 @@ app.delete('/api/habits/:id', async (req, res) => {
     res.status(500).json({ message: 'Cannot delete habit' });
   }
 });
+
 /* ========== STATS API ========== */
 
 // Cộng (hoặc trừ) số ngày vào một ngày dạng YYYY-MM-DD.
@@ -476,7 +494,7 @@ function addDays(dateStr, days) {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-// Thống kê tiến độ.
+// Thống kê tiến độ của người dùng.
 // Dùng: GET /api/stats?date=YYYY-MM-DD (ngày hôm nay theo máy người dùng)
 app.get('/api/stats', async (req, res) => {
   const today = req.query.date;
@@ -488,18 +506,20 @@ app.get('/api/stats', async (req, res) => {
   }
 
   try {
-    const [habits] = await pool.query(
+    const [habits] = await pool.execute(
       `SELECT id, name, target_per_week
        FROM habits
-       WHERE is_active = 1
-       ORDER BY created_at DESC`
+       WHERE is_active = 1 AND user_id = ?
+       ORDER BY created_at DESC`,
+      [req.user.id]
     );
 
     const [logs] = await pool.execute(
-      `SELECT habit_id, DATE_FORMAT(completed_date, '%Y-%m-%d') AS d
-       FROM habit_logs
-       WHERE completed_date <= ?`,
-      [today]
+      `SELECT hl.habit_id, DATE_FORMAT(hl.completed_date, '%Y-%m-%d') AS d
+       FROM habit_logs hl
+       JOIN habits h ON h.id = hl.habit_id
+       WHERE h.user_id = ? AND hl.completed_date <= ?`,
+      [req.user.id, today]
     );
 
     // Gom các ngày đã hoàn thành theo từng thói quen.
@@ -568,6 +588,7 @@ app.get('/api/stats', async (req, res) => {
     res.status(500).json({ message: 'Cannot retrieve stats' });
   }
 });
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`HabitFlow API running at http://localhost:${PORT}`);
 });
