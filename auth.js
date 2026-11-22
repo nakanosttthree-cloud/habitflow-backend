@@ -1,9 +1,17 @@
+const crypto = require('crypto');
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
+const { sendCodeEmail } = require('./mailer');
+
 const USERNAME_PATTERN = /^[a-z0-9_.]{3,30}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CODE_PATTERN = /^\d{6}$/;
+
+const CODE_MINUTES = 15;    // mã có hiệu lực bao lâu
+const MAX_ATTEMPTS = 5;     // số lần nhập sai tối đa cho một mã
+const RESEND_SECONDS = 60;  // khoảng cách tối thiểu giữa hai lần gửi mã
 
 // Dùng khi không tìm thấy tài khoản, để thời gian phản hồi
 // không tiết lộ tên đăng nhập có tồn tại hay không.
@@ -42,6 +50,22 @@ function readText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function isValidPassword(password) {
+  return password.length >= 8 && password.length <= 72;
+}
+
+function generateCode() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+// Băm mã để không lưu mã gốc trong database.
+function hashCode(userId, purpose, code) {
+  return crypto
+    .createHmac('sha256', getSecret())
+    .update(`${userId}:${purpose}:${code}`)
+    .digest('hex');
+}
+
 // Middleware: yêu cầu đăng nhập. Gắn req.user = { id, username }.
 function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -67,6 +91,90 @@ function createAuthRouter(pool) {
 
   const router = express.Router();
 
+  // Tạo mã mới và gửi email. Trả về 'sent' hoặc 'too_soon'.
+  async function issueCode(user, purpose) {
+    const [recent] = await pool.query(
+      `SELECT id FROM email_codes
+       WHERE user_id = ? AND purpose = ?
+         AND created_at > DATE_SUB(UTC_TIMESTAMP(),
+                                   INTERVAL ${RESEND_SECONDS} SECOND)
+       LIMIT 1`,
+      [user.id, purpose]
+    );
+
+    if (recent.length > 0) {
+      return 'too_soon';
+    }
+
+    // Mã cũ chưa dùng không còn hiệu lực.
+    await pool.execute(
+      `UPDATE email_codes SET used_at = UTC_TIMESTAMP()
+       WHERE user_id = ? AND purpose = ? AND used_at IS NULL`,
+      [user.id, purpose]
+    );
+
+    const code = generateCode();
+
+    const [result] = await pool.query(
+      `INSERT INTO email_codes (user_id, purpose, code_hash, expires_at)
+       VALUES (?, ?, ?, DATE_ADD(UTC_TIMESTAMP(),
+                                 INTERVAL ${CODE_MINUTES} MINUTE))`,
+      [user.id, purpose, hashCode(user.id, purpose, code)]
+    );
+
+    try {
+      await sendCodeEmail(user.email, purpose, code, CODE_MINUTES);
+    } catch (error) {
+      // Gửi lỗi thì bỏ mã vừa tạo để người dùng yêu cầu lại được ngay.
+      await pool.execute(
+        'DELETE FROM email_codes WHERE id = ?',
+        [result.insertId]
+      );
+      throw error;
+    }
+
+    return 'sent';
+  }
+
+  // Kiểm tra mã. Đúng thì đánh dấu đã dùng và trả về true.
+  async function checkCode(user, purpose, code) {
+    const [rows] = await pool.execute(
+      `SELECT id, code_hash, attempts FROM email_codes
+       WHERE user_id = ? AND purpose = ?
+         AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
+       ORDER BY id DESC
+       LIMIT 1`,
+      [user.id, purpose]
+    );
+
+    const row = rows[0];
+
+    if (!row || row.attempts >= MAX_ATTEMPTS) {
+      return false;
+    }
+
+    const expected = Buffer.from(row.code_hash, 'hex');
+    const actual = Buffer.from(hashCode(user.id, purpose, code), 'hex');
+    const match =
+      expected.length === actual.length &&
+      crypto.timingSafeEqual(expected, actual);
+
+    if (!match) {
+      await pool.execute(
+        'UPDATE email_codes SET attempts = attempts + 1 WHERE id = ?',
+        [row.id]
+      );
+      return false;
+    }
+
+    await pool.execute(
+      'UPDATE email_codes SET used_at = UTC_TIMESTAMP() WHERE id = ?',
+      [row.id]
+    );
+
+    return true;
+  }
+
   // Đăng ký tài khoản.
   router.post('/register', async (req, res) => {
     const username = readText(req.body.username).toLowerCase();
@@ -85,7 +193,7 @@ function createAuthRouter(pool) {
       return res.status(400).json({ message: 'Email không hợp lệ' });
     }
 
-    if (password.length < 8 || password.length > 72) {
+    if (!isValidPassword(password)) {
       return res.status(400).json({
         message: 'Mật khẩu phải từ 8 đến 72 ký tự'
       });
@@ -104,10 +212,18 @@ function createAuthRouter(pool) {
         'SELECT * FROM users WHERE id = ?',
         [result.insertId]
       );
+      const user = rows[0];
+
+      // Gửi mã xác thực email; lỗi gửi không làm hỏng việc đăng ký.
+      try {
+        await issueCode(user, 'verify');
+      } catch (mailError) {
+        console.error('Send verification error:', mailError.message);
+      }
 
       res.status(201).json({
-        token: signToken(rows[0]),
-        user: publicUser(rows[0])
+        token: signToken(user),
+        user: publicUser(user)
       });
     } catch (error) {
       if (error.code === 'ER_DUP_ENTRY') {
@@ -174,6 +290,164 @@ function createAuthRouter(pool) {
     } catch (error) {
       console.error('Get me error:', error.message);
       res.status(500).json({ message: 'Không lấy được thông tin tài khoản' });
+    }
+  });
+
+  // Gửi (lại) mã xác thực email cho người đang đăng nhập.
+  router.post('/send-verification', requireAuth, async (req, res) => {
+    try {
+      const [rows] = await pool.execute(
+        'SELECT * FROM users WHERE id = ?',
+        [req.user.id]
+      );
+      const user = rows[0];
+
+      if (!user) {
+        return res.status(401).json({ message: 'Tài khoản không còn tồn tại' });
+      }
+
+      if (user.email_verified) {
+        return res.json({ message: 'Email đã được xác thực' });
+      }
+
+      const status = await issueCode(user, 'verify');
+
+      if (status === 'too_soon') {
+        return res.status(429).json({
+          message: `Vui lòng đợi ${RESEND_SECONDS} giây trước khi yêu cầu mã mới`
+        });
+      }
+
+      res.json({ message: 'Đã gửi mã xác thực tới email của bạn' });
+    } catch (error) {
+      console.error('Send verification error:', error.message);
+      res.status(500).json({ message: 'Không gửi được email xác thực' });
+    }
+  });
+
+  // Xác thực email bằng mã 6 số.
+  router.post('/verify-email', requireAuth, async (req, res) => {
+    const code = readText(req.body.code);
+
+    if (!CODE_PATTERN.test(code)) {
+      return res.status(400).json({ message: 'Mã gồm 6 chữ số' });
+    }
+
+    try {
+      const [rows] = await pool.execute(
+        'SELECT * FROM users WHERE id = ?',
+        [req.user.id]
+      );
+      const user = rows[0];
+
+      if (!user) {
+        return res.status(401).json({ message: 'Tài khoản không còn tồn tại' });
+      }
+
+      if (user.email_verified) {
+        return res.json(publicUser(user));
+      }
+
+      if (!(await checkCode(user, 'verify', code))) {
+        return res.status(400).json({
+          message: 'Mã không đúng hoặc đã hết hạn'
+        });
+      }
+
+      await pool.execute(
+        'UPDATE users SET email_verified = 1 WHERE id = ?',
+        [user.id]
+      );
+      user.email_verified = 1;
+
+      res.json(publicUser(user));
+    } catch (error) {
+      console.error('Verify email error:', error.message);
+      res.status(500).json({ message: 'Không xác thực được email' });
+    }
+  });
+
+  // Quên mật khẩu: gửi mã tới email (chỉ khi email đã xác thực).
+  // Luôn trả lời giống nhau để không lộ tài khoản nào tồn tại.
+  router.post('/forgot-password', async (req, res) => {
+    const identifier = readText(req.body.identifier).toLowerCase();
+
+    const reply = () => res.json({
+      message:
+        'Nếu tài khoản tồn tại và email đã được xác thực, mã đặt lại mật khẩu đã được gửi.'
+    });
+
+    if (!identifier) {
+      return res.status(400).json({
+        message: 'Vui lòng nhập tên đăng nhập hoặc email'
+      });
+    }
+
+    try {
+      const [rows] = await pool.execute(
+        'SELECT * FROM users WHERE username = ? OR email = ? LIMIT 1',
+        [identifier, identifier]
+      );
+      const user = rows[0];
+
+      if (user && user.email_verified) {
+        try {
+          await issueCode(user, 'reset');
+        } catch (mailError) {
+          console.error('Send reset code error:', mailError.message);
+        }
+      }
+
+      reply();
+    } catch (error) {
+      console.error('Forgot password error:', error.message);
+      res.status(500).json({ message: 'Không xử lý được yêu cầu' });
+    }
+  });
+
+  // Đặt lại mật khẩu bằng mã nhận qua email.
+  router.post('/reset-password', async (req, res) => {
+    const identifier = readText(req.body.identifier).toLowerCase();
+    const code = readText(req.body.code);
+    const newPassword =
+      typeof req.body.new_password === 'string' ? req.body.new_password : '';
+
+    if (!identifier || !CODE_PATTERN.test(code)) {
+      return res.status(400).json({
+        message: 'Mã không đúng hoặc đã hết hạn'
+      });
+    }
+
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).json({
+        message: 'Mật khẩu phải từ 8 đến 72 ký tự'
+      });
+    }
+
+    try {
+      const [rows] = await pool.execute(
+        'SELECT * FROM users WHERE username = ? OR email = ? LIMIT 1',
+        [identifier, identifier]
+      );
+      const user = rows[0];
+
+      if (!user || !(await checkCode(user, 'reset', code))) {
+        return res.status(400).json({
+          message: 'Mã không đúng hoặc đã hết hạn'
+        });
+      }
+
+      const hash = await bcrypt.hash(newPassword, 10);
+
+      await pool.execute(
+        'UPDATE users SET password_hash = ? WHERE id = ?',
+        [hash, user.id]
+      );
+
+      res.json({ message: 'Đã đổi mật khẩu. Hãy đăng nhập lại.' });
+    } catch (error) {
+      console.error('Reset password error:', error.message);
+      res.status(500).json({ message: 'Không đổi được mật khẩu' });
     }
   });
 
